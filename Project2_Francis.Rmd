@@ -1,0 +1,409 @@
+---
+title: 'Project 2: Supervised and Unsupervised Learning'
+author: "SDS322E"
+date: ''
+output:
+  html_document:
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+  pdf_document:
+    toc: no
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, fig.align = "center", warning = F, message = F,
+tidy=TRUE, tidy.opts=list(width.cutoff=60), R.options=list(max.print=100))
+
+class_diag <- function(score, truth, positive, cutoff=.5){
+
+  pred <- factor(score>cutoff,levels=c("TRUE","FALSE"))
+  truth <- factor(truth==positive, levels=c("TRUE","FALSE"))
+
+  tab<-table(truth, pred)
+  acc=sum(diag(tab))/sum(tab)
+  sens=tab[1,1]/rowSums(tab)[1]
+  spec=tab[2,2]/rowSums(tab)[2]
+  ppv=tab[1,1]/colSums(tab)[1]
+
+#CALCULATE F1
+  f1=2*(sens*ppv)/(sens+ppv)
+  
+#CALCULATE EXACT AUC
+  truth<-as.numeric(truth=="TRUE")
+  ord<-order(score, decreasing=TRUE)
+  score <- score[ord]; truth <- truth[ord]
+  TPR=cumsum(truth)/max(1,sum(truth))
+  FPR=cumsum(!truth)/max(1,sum(!truth))
+  dup<-c(score[-1]>=score[-length(score)], FALSE)
+  TPR<-c(0,TPR[!dup],1); FPR<-c(0,FPR[!dup],1)
+  n <- length(TPR)
+  auc<- sum( ((TPR[-1]+TPR[-n])/2) * (FPR[-1]-FPR[-n]) )
+  round(data.frame(acc,sens,spec,ppv,f1,ba=(sens+spec)/2,auc, row.names = "Metrics"),4)
+}
+```
+### Wenhan Li, Francis Tang, River Tomlinson, Evin McDonald
+### Introduction
+**The following dataset is a summary of Texas Health Factors / Outcomes by county. The data was pulled from the County Health Rankings website. In our analysis, we have dozens of variables included, but those of note are the Health Factor Quintile, Health Outcome Quintile, and Presence of Water Violation as categorical variables (Presence of water violation is binary). The Health Outcome quintile shows where a county lies in terms of quality of life, while the Health Factor quintile shows how well a county is 'set up' to have good health outcomes, so to speak. We are also wanting to see if some of our numerical variables are of note, specifically income ratio, % uninsured, teen birth rate, violent crime rate, demographic rates, and food statistics. All of these variables are numeric. There are 254 counties being analyzed, with around 50 counties lying in each quintile of our categorical variables and there being 150 counties with a presence of water violation, while 104 counties did not.  **
+
+
+##Setup Chunk - Loading data and required packages
+```{r setup2}
+Project2Raw <- read.csv("Project2RawAdjusted.csv", fileEncoding="UTF-8-BOM")
+library(tidyverse)
+library(caret)
+library(rpart)
+library(ggExtra)
+library(randomForest)
+library(ggthemes)
+library(GGally)
+library(pROC)
+suppressMessages(library(caret))
+```
+### Data Adjustment
+```{r data_adjust}
+Project2Raw$Health.Factor.Rank <- as.numeric(Project2Raw$Health.Factor.Rank) #Making ranking variable numeric
+Project2Raw$Health.Outcome.Rank <- as.numeric(Project2Raw$Health.Outcome.Rank) #Same as above
+quantile(Project2Raw$Health.Outcome.Rank, probs = seq(0,1,0.2), na.rm=TRUE) #Listing ranking quintiles
+O_rank <- Project2Raw$Health.Outcome.Rank
+F_rank <- Project2Raw$Health.Factor.Rank
+Project2Data <- Project2Raw %>% mutate("OutcomeQuintile" = ifelse(
+  O_rank < 49, "First", ifelse(
+    O_rank >48 & O_rank < 98, "Second", ifelse (
+      O_rank > 97 & O_rank < 146, "Third", ifelse( 
+        O_rank > 145 & O_rank < 194, "Fourth", "Fifth"
+          
+        ))
+    )
+  )
+) %>% 
+  mutate("FactorQuintile" = ifelse(
+  F_rank < 49, "First", ifelse(
+    F_rank >48 & F_rank < 98, "Second", ifelse (
+      F_rank > 97 & F_rank < 146, "Third", ifelse( 
+        F_rank > 145 & F_rank < 194, "Fourth", "Fifth"
+          
+        ))
+    )
+  )
+) #Creating categorical variable showing which quintile a county's health factor / outcome ranking lies in
+dim(Project2Data)
+Project2 <- Project2Data %>% select(-PCPRatio, -Dentist.Ratio, -MHPRatio, -X, Health.Outcome.Rank, Health.Factor.Rank, -FIPS) #Removing columns that do not do well in calculations or are unnecessary
+Project2 <- Project2[-c(1),] #Removing first row, which is aggregate data.
+dim(Project2)
+
+```
+**We put the data through minor adjustments to get a couple of categorical variables that we could use in creating clusters and performing other analysis. This was simply summarizing the health factor/outcome rankings for each Texas county. These variables have significant differences - the Health Outcome index of a county is life expectancy and overall quality of life, while the Health Factor index is a measure of health behaviors and observations, i.e, measures of things that contribute to overall health but do not necessarily determine it.**
+
+### 1. Clustering
+```{r kmeans}
+clustered_data <- Project2 %>% select(X.FairPoorHealth, X.LowBirthwt, X.Smokers, X.Uninsured, X.ExcessiveDrinking, X..Unemployed, X..Rural, X..Completed.High.School, X..Food.Insecure, X..65.and.Over)
+no_na <- na.omit(clustered_data)
+kmeans(no_na, centers = 3, iter.max = 10, nstart=100)
+
+```
+
+```{r elbow}
+#Setting up elbow plot in order to find an optimal value for k
+cluster_ratio <- function(k_max) {
+ratios <- numeric(k_max)
+for(k in 1:k_max) {
+km <- no_na %>% kmeans(centers = k, nstart = 100)
+ratios[k] <- 1 - km$betweenss / km$totss
+}
+return(ratios)
+}
+elbow_df <- tibble(ratio = cluster_ratio(15), k = 1:15)
+ggplot(elbow_df, aes(x = k, y = ratio)) + geom_point() + geom_line() +
+xlab("Number of Clusters") + ylab("Percent variance not accounted for by clustering")
+```
+
+```{r kplots}
+km <- kmeans(no_na, centers = 3) #Storing KM
+km_cluster <- as.factor(km$cluster) #Creating cluster vector
+cluster_data <- data.frame(no_na, cluster = km_cluster)  #Creating dataframe that includes our selected variables along with which cluster they belong to
+ggpairs(data = no_na, columns = c(1:10), aes(colour = km_cluster), diag = list(continuous = "blankDiag"), upper = list(continuous = wrap("cor", size = 2))) #Making plots
+
+
+```
+
+
+**For our K-means clustering, we chose ten variables: Income Ratio, %Low Birthweight, %Smokers, %CompletedHighSchool, %Rural, %Unemployed, %Uninsured, %65over, %Excessive Drinking, and %Food Insecure. We chose all percentages for the purpose of proper scaling so that the clustering would not be too scattered.**
+**To find an optimal number of clusters we created an elbow plot. The output of our elbow plot clearly depicts that 3 is the optimal number, although we would have expected 5 to be the best number due to our categorical variables being split into five groups. In this case we will use 3 clusters in accordance with the elbow plot.**
+**In looking at all of the pairwise plots, we see that those being paired with %Rural on the y-axis show the most apparent separation of clusters. We also see in the cluster chart that %Rural does indeed have the least overlap in its clusters, with clusters 1, 2, and 3 having means of approximately 10, 40, and 60 respectively. **
+
+
+
+### 2. Dimensionality Reduction
+```{r pca}
+Project2nona <- na.omit(Project2)
+PCAdf <- Project2nona %>% 
+  select(-State, -County, -Presence.of.Water.Violation, -OutcomeQuintile, -FactorQuintile) %>% 
+  sapply(as.numeric) #Remove categoricals.
+#  na.omit() #Remove NAs.
+PCAdf <- PCAdf %>% scale()
+dim(PCAdf)
+ProjectPCA <- prcomp(PCAdf, scale = TRUE)
+names(ProjectPCA)
+```
+**In the above chunk, we set up the PCA analysis and perform it. Next, we will see the PCA plots for both health factor and health outcome rankings to see how the clusters compare.** 
+```{r pcaplot}
+PCA_data <- data.frame(ProjectPCA$x, FactorQuintile <- Project2nona$FactorQuintile, OutcomeQuintile <- Project2nona$OutcomeQuintile) #Make dataframe for PCA and include quintiles for both health factor  and health outcome rankings.
+
+rotation_data <- data.frame(
+  ProjectPCA$rotation, 
+  variable = row.names(ProjectPCA$rotation)
+)
+arrow_style <- arrow(
+  length = unit(0.05, "inches"),
+  type = "closed"
+) #Giving arrow style used in class
+
+
+ggplot(PCA_data, aes(x = PC1, y = PC2, color = FactorQuintile)) + geom_point() +scale_color_colorblind() + ggtitle("PCA compared to Health Factor quintiles")#Plot for Health Factor
+
+ggplot(PCA_data, aes(x = PC1, y = PC2, color = OutcomeQuintile)) + geom_point() +scale_color_colorblind() + ggtitle("PCA compared to Health Outcome quintiles")#Plot for health Outcome
+
+ggplot(rotation_data) + 
+  geom_segment(aes(xend = PC1, yend = PC2), x = 0, y = 0, arrow = arrow_style) + 
+  xlim(-1., 1.25) +  #Leaving out arrow labels for now since we are analyzing ~60 variables and do not want to clutter.
+  ylim(-1., 1.) +
+  coord_fixed() + ggtitle("Arrow Plot for PC1/PC2")# fix aspect ratio to 1:1
+
+```
+**We notice in these plots that there is no clear indicator of separate clusters or even one variable that has a significant contribution to either PC as compared to the rest. PC1 gives a possibility of separation between the 'main' cluster and the outliers, but it is iffy. Either we are using too many variables, or there is simply nothing to find in the dataset. The color labels give a possibility of clustering along PC1, but a completely unsupervised analysis would not give any solid conclusion. Next we take a look at the variances to see if the plots perhaps failed to show us something more..**
+```{r variance}
+PercVariance <- 100*ProjectPCA$sdev^2 / sum(ProjectPCA$sdev^2) #Creating vector of variance per PC
+perc_data <- data.frame(percent = PercVariance, PC = 1:length(PercVariance)) #Dataframe for plot
+ggplot(perc_data, aes(x = PC, y = percent)) + 
+  geom_col() + 
+  geom_text(aes(label = round(percent, 2)), size = 4, vjust = -0.5) + 
+  ylim(0, 80) + xlim(0,6) +ggtitle("Percent of Variance by PC") + theme_solarized() #Creating plot to visualize PC variance
+
+```
+**Our first two PCs contribute around 48% of the total variance in the dataset. While it is close to half, it would be preferable to have a larger variance proportion in order to make any solid conclusions regarding the data. Including PCs 1-6 raises this variance to nearly 70% - a notable improvement, though it is once again more ideal to have this variance be weighted moreso to the first few PCs. **
+
+### 3. Logistic Regression and Cross-Validation
+Use logistic regression to predict a binary variable (response) from the numeric variables in your dataset (if you have 10+ you can reduce to 10). Train the model to the entire dataset and use it to get predictions for all of the observations. Ignoring train/test split issues, compute the (i) accuracy, (ii) sensitivity and specificity, and (iii) the AUC from an ROC curve. How well do you feel that your classifier is doing in terms of prediction? Mainly just your opinion about how its doing versus well you feel it should be possible to predict the variable of interest.
+```{r glmsetup}
+#create dataset with no NA
+#select columns that are not percentiles
+Project2GLM <- Project2 %>% 
+  na.omit() %>% 
+  mutate(Presence.of.Water.Violation = ifelse(Presence.of.Water.Violation == "No", 0, 1)) %>% 
+  select(Presence.of.Water.Violation, Deaths, Food.Environment.Index, TeenBirthRate, Population, Income.Ratio, ViolentCrimeRate, Life.Expectancy, High.School.Graduation.Rate, Median.Household.Income, Segregation.index, Firearm.Fatalities.Rate, Juvenile.Arrest.Rate, Traffic.Volume)
+
+#create glm model for all dataset
+glm_Project2 <- glm(Presence.of.Water.Violation ~ .,
+                   data = Project2GLM, family = binomial)
+summary(glm_Project2)
+```
+
+```{r cvGLM}
+threshold=0.5
+predicted_glm <- ifelse(predict(glm_Project2,type="response")>threshold,1,0)
+actual_values <- Project2GLM$Presence.of.Water.Violation
+conf_matrix_glm <- table(predicted_glm,actual_values)
+#calculate accuracy, sensitivity, specificity, and AUC of pre-split glm.
+accuracy <- mean(predicted_glm == Project2GLM$Presence.of.Water.Violation)
+accuracy
+sensitivity(conf_matrix_glm)
+specificity(conf_matrix_glm)
+# the AUC from an ROC curve
+as.numeric(auc(Project2GLM$Presence.of.Water.Violation, predicted_glm))
+```
+
+```{r specs1}
+par(pty="s")
+roc_obj <- roc(Project2GLM$Presence.of.Water.Violation, predicted_glm,plot=TRUE,print.auc=TRUE,col="green",lwd =4,legacy.axes=TRUE,main="ROC Curves")
+```
+**This classifier is not doing well. While the accuracy of 70% looks acceptable, the AUC of 58% indicates problem, and it's because its sensitivity is only at 25%, which means about it fails to identify the majority of the positive cases. It achieved its high accuracy through the specificity at 90%, which means when it identify the positive cases, most of them are correct, but at a price of missing many positive cases. That indiciates the threshold for the classifer could be set too high. So this classifier has an un-balanced performance, under some use cases, this low-sensitivity and high-specificity performance is not desirable.**
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+accuracy_v = c()
+sensitivity_v = c()
+specificity_v = c()
+auc_v = c()
+set.seed(12345)
+for (i in 1:20) {
+  inTrain <- createDataPartition(y = Project2GLM$Presence.of.Water.Violation, p = .80, list = FALSE)
+  training <- Project2GLM[inTrain,]
+  testing <- Project2GLM[-inTrain,]
+  model <- glm(formula = Presence.of.Water.Violation ~ ., family = "binomial", data = training)
+  prob = predict(model, testing, type="response")
+  predicted = rep.int(0, dim(testing)[1])
+  predicted[prob > .5] = 1
+  t <- table(predicted, reference = testing$Presence.of.Water.Violation)
+  accuracy_v <- mean(predicted == testing$Presence.of.Water.Violation)
+  sensitivity_v <- sensitivity(t)
+  specificity_v <- specificity(t)
+  auc_v <- as.numeric(auc(testing$Presence.of.Water.Violation, predicted))
+}
+mean(accuracy_v)
+mean(sensitivity_v)
+mean(specificity_v)
+mean(auc_v)
+```
+**The classifier built using the k-fold methods has a noticeably different performance profile. Its sensitivity improved to 50% and its specificity lowered to 70%. While its overall accuracy and AUC stayed relatively stable. I feel this balanced performance on handling false positive and false negative is more desirable in many use cases .**
+
+### 4. Tree-Based Classifiers and CV
+```{r cart}
+
+#Fit a CART and a random forest to the exact same dataset/variables you used with the logistic regression. Use the entire dataset for this.
+#Train the models to the entire dataset and use it to get predictions for all of the observations. Ignoring train/test split issues, compute the (i) accuracy, (ii) sensitivity and specificity, and (iii) the AUC from an ROC curve.
+
+#create CART model for all dataset
+CART_Project2 <- rpart(Presence.of.Water.Violation ~ ., data = Project2GLM)
+rpart.plot::rpart.plot(CART_Project2)
+predicted_CART <- predict(CART_Project2, Project2GLM)
+predicted = rep.int(0, dim(Project2GLM)[1])
+predicted[predicted_CART > .5] = 1
+#calculate accuracy, sensitivity, specificity, and AUC of pre-split CART.
+mean(predicted == Project2GLM$Presence.of.Water.Violation)
+conf_matrix_CART <- table(predicted, Project2GLM$Presence.of.Water.Violation)
+sensitivity(conf_matrix_CART)
+specificity(conf_matrix_CART)
+as.numeric(auc(Project2GLM$Presence.of.Water.Violation, predicted_CART))
+par(pty="s")
+roc_obj <- roc(Project2GLM$Presence.of.Water.Violation, predicted_CART,plot=TRUE,print.auc=TRUE,col="green",lwd =4,legacy.axes=TRUE,main="ROC Curves")
+
+#Repeat the above, but instead do it using a division into training/test sets with 80% train and 20% test. Repeat the train/test split 20 times and compute the #accuracy/sensitivity/specificity/AUC averaged over the 20 different splits (no need to plot the ROC for this).
+accuracy_v = c()
+sensitivity_v = c()
+specificity_v = c()
+auc_v = c()
+for (u in 1:20) {
+  set.seed(123 + i)
+  inTrain <- createDataPartition(y = Project2GLM$Presence.of.Water.Violation, p = .80, list = FALSE)
+  training <- Project2GLM[inTrain,]
+  testing <- Project2GLM[-inTrain,]
+  CART_Project2 <- rpart(Presence.of.Water.Violation ~ ., data = training)
+#  rpart.plot::rpart.plot(CART_Project2)
+  predicted_CART <- predict(CART_Project2, testing)
+  predicted = rep.int(0, dim(testing)[1])
+  predicted[predicted_CART > .5] = 1
+  #calculate accuracy, sensitivity, specificity, and AUC of pre-split CART.
+  accuracy_v <- append(accuracy_v, mean(predicted == Project2GLM$Presence.of.Water.Violation))
+  conf_matrix <- table(predicted, testing$Presence.of.Water.Violation)
+  sensitivity_v <- append(sensitivity_v, sensitivity(conf_matrix))
+  specificity_v <-append(specificity_v, specificity(conf_matrix))
+  auc_v <- append(auc_v, as.numeric(auc(testing$Presence.of.Water.Violation, predicted_CART)))
+}
+mean(accuracy_v)
+mean(sensitivity_v)
+mean(specificity_v)
+mean(auc_v)
+```
+``` {r}
+#Discuss the results in a paragraph. How well is your model predicting new observations? Do you see signs of overfitting? 
+#How does your nonparametric model compare with the logistic regression in its cross-validation performance?
+```
+**Looking at the average model performance profile from the k-fold testing, the average accuracy is 58%, sensitivity is 28%, specificity is 72% and AUC is 64%. They are all significantly lower than the numbers observed when the model is trained and tested using the same entire data set.  That indicates signs of overfitting. Overall, the model is doing much better in specificity than sensitivity. Comparing this nonparametric with the logistic regression, the overall AUC is better, the sensitivity is doing worse, while the specificity and accurary are about the same.**
+
+```{r randomforest}
+# Fit a random forest model
+RF_Project2 <- randomForest(as.factor(Presence.of.Water.Violation) ~ .,
+                   data = Project2GLM)
+predicted_RF <- predict(RF_Project2, data = Project2GLM)
+conf_matrix_RF <- table(predicted_RF,actual_values)
+#calculate accuracy, sensitivity, specificity, and AUC of pre-split RF.
+mean(predicted_RF == Project2GLM$Presence.of.Water.Violation)
+sensitivity(conf_matrix_RF)
+specificity(conf_matrix_RF)
+rf.roc<-roc(Project2GLM$Presence.of.Water.Violatio, RF_Project2$votes[,2])
+plot(rf.roc)
+auc(rf.roc)
+
+#Repeat the above, but instead do it using a division into training/test sets with 80% train and 20% test. Repeat the train/test split 20 times and compute the #accuracy/sensitivity/specificity/AUC averaged over the 20 different splits (no need to plot the ROC for this).
+accuracy_v = c()
+sensitivity_v = c()
+specificity_v = c()
+auc_v = c()
+for (u in 1:20) {
+  set.seed(123 + i)
+  inTrain <- createDataPartition(y = Project2GLM$Presence.of.Water.Violation, p = .80, list = FALSE)
+  training <- Project2GLM[inTrain,]
+  testing <- Project2GLM[-inTrain,]
+  model <- randomForest(as.factor(Presence.of.Water.Violation) ~ ., data = training)
+  predicted <- predict(model, newdata = testing)
+  conf_matrix_RF <- table(predicted, testing$Presence.of.Water.Violation)
+  #calculate accuracy, sensitivity, specificity, and AUC of pre-split RF.
+  accuracy_v <- mean(predicted_RF == Project2GLM$Presence.of.Water.Violation)
+  sensitivity_v <- sensitivity(conf_matrix_RF)
+  specificity_v <- specificity(conf_matrix_RF)
+  auc_v <- auc(roc(training$Presence.of.Water.Violatio, model$votes[,2]))
+}
+mean(accuracy_v)
+mean(sensitivity_v)
+mean(specificity_v)
+mean(auc_v)
+```
+
+```{r complexityParameter}
+#Use caret to choose an appropriate complexity parameter for your CART fit. Then, plot the resulting tree obtained from using this parameter. Finally, provide an interpretation of how the tree is doing the classifications.
+set.seed(123)
+suppressMessages(library(caret))
+index = createDataPartition(y=Project2GLM$Presence.of.Water.Violation, p=0.7, list=FALSE)
+train.set = Project2GLM[index,]
+test.set = Project2GLM[-index,]
+model2 <- train(
+  Presence.of.Water.Violation ~., 
+  data = train.set, 
+  method = "rpart",
+  trControl = trainControl("cv", number = 5),
+  tuneLength = 10
+  )
+# Plot model accuracy vs different values of
+# cp (complexity parameter)
+plot(model2)
+rpart.plot::rpart.plot(model2$finalModel)
+```
+
+
+### 5. Regression / Prediction
+```{r linmodel}
+# Fit a linear regression model or regression tree to your entire dataset, predicting one of your numeric variables from at least 2 other variables
+lm_data <- Project2 %>%
+  select(
+    Juvenile.Arrest.Rate,
+    X..Vaccinated,
+    X.PovertyChildren,
+    X.FairPoorHealth, 
+    X..Some.College, 
+    X..Unemployed,
+    X20th.Percentile.Income,
+    TeenBirthRate,
+    ViolentCrimeRate,
+    ) %>%
+  na.omit()
+dim(lm_data)
+lm_model <- lm(Juvenile.Arrest.Rate ~ ., data = lm_data) 
+summary(lm_model)
+
+# Report the MSE for the overall dataset.
+mean(lm_model$residuals^2)
+predicted_lm <- predict(lm_model, data = lm_data)
+mse <- mean((predicted_lm -lm_data$Juvenile.Arrest.Rate )^2)
+cat("mse is ", mse)
+
+# Perform k-fold CV on this same model (fine to use caret). Calculate the average MSE across your k testing folds.
+set.seed(12345)
+# using 5-fold to get roughly 80/20 training/testing split
+train_control <- trainControl(method = "cv", number = 5)
+cv_model <- train(Juvenile.Arrest.Rate ~. , data = lm_data, 
+               method = "lm",
+               trControl = train_control)
+cv_model
+cv_model$resample
+cv_mse <- mean(cv_model$resample$RMSE^2)
+cat("average mse from the testing fold is ", cv_mse)
+# Does this model show signs of overfitting? Discussion the results in a paragraph.
+```
+**When the MSE over the testing data set is noticeably higher than the MSE over the training data set, the model shows signs of overfitting. In our case, we observed that the MSE of the model over its overall data is about 68 while the average MSE of the 5-fold testing test data is about 75. Thus, we conclude our model show signs of overfitting. In our linear model, for the response variable Juvenile.Arrest.Rate, we see high correlation from predictors TeenBirthRate and ViolentCrimeRate, an acceptable correlation from the predictor X..Unemployed and no statistically meaningful correlation from other predictor variables.**
+
+
+
+
+
+
+
